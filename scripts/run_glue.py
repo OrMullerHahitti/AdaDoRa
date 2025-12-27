@@ -12,9 +12,10 @@ from typing import Optional
 import datasets
 import evaluate
 import numpy as np
-from datasets import load_dataset
-
+import torch
+import torch.nn.functional as F
 import transformers
+from datasets import load_dataset
 from transformers import (
     AutoConfig,
     AutoModelForSequenceClassification,
@@ -29,7 +30,8 @@ from transformers import (
     set_seed,
 )
 
-from peft import AdaLoraConfig, get_peft_model, PeftType
+from peft import AdaLoraConfig, PeftType, get_peft_model
+
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +88,7 @@ class AdaLoraArguments:
     tinit: int = field(default=200, metadata={"help": "Initial warmup steps (no pruning)"})
     tfinal: int = field(default=1000, metadata={"help": "Final steps (fixed rank fine-tuning)"})
     deltaT: int = field(default=10, metadata={"help": "Interval between rank allocations"})
+    orth_reg_weight: float = field(default=0.5, metadata={"help": "Orthogonal regularization weight (0.0 to disable)"})
     target_modules: Optional[str] = field(
         default="query,value",
         metadata={"help": "Comma-separated target modules (e.g., 'query,value')"},
@@ -95,14 +98,80 @@ class AdaLoraArguments:
 class AdaLoraCallback(TrainerCallback):
     """Callback to update AdaLoRA rank allocation during training."""
 
-    def __init__(self, model):
+    def __init__(self, model, skip_allocation: bool = False):
         self.model = model
+        self.skip_allocation = skip_allocation
 
     def on_step_end(self, args, state, control, **kwargs):
+        # skip rank allocation if init_r == target_r (no pruning needed)
+        if self.skip_allocation:
+            return
         # update_and_allocate must be called after backward but we call it here
         # in practice you might want to integrate this more carefully
         if hasattr(self.model, "base_model") and hasattr(self.model.base_model, "update_and_allocate"):
             self.model.base_model.update_and_allocate(state.global_step)
+
+
+class AdaLoraTrainer(Trainer):
+    """
+    Custom Trainer that separately tracks CE loss and regularization loss.
+
+    AdaLoRA adds orthogonal regularization to the loss inside the model forward pass.
+    This trainer extracts and logs the pure CE loss for fair comparison with other methods.
+    """
+
+    def __init__(self, *args, is_regression: bool = False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.is_regression = is_regression
+        # running averages for logging
+        self._ce_loss_sum = 0.0
+        self._reg_loss_sum = 0.0
+        self._loss_count = 0
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        """
+        Compute loss and separately track CE vs regularization components.
+
+        The model's forward adds: outputs.loss = CE_loss + orth_reg_weight * reg_loss
+        We compute CE manually from logits to get both components.
+        """
+        labels = inputs.get("labels")
+
+        # forward pass - this returns total_loss = CE + regularization
+        outputs = model(**inputs)
+        total_loss = outputs.loss
+        logits = outputs.logits
+
+        # compute pure CE loss from logits
+        if labels is not None:
+            if self.is_regression:
+                ce_loss = F.mse_loss(logits.squeeze(), labels.squeeze())
+            else:
+                ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1))
+
+            # regularization = total - CE
+            reg_loss = total_loss - ce_loss
+
+            # accumulate for logging
+            self._ce_loss_sum += ce_loss.detach().item()
+            self._reg_loss_sum += reg_loss.detach().item()
+            self._loss_count += 1
+
+        return (total_loss, outputs) if return_outputs else total_loss
+
+    def log(self, logs: dict, start_time: Optional[float] = None) -> None:
+        """Override log to include CE and regularization loss breakdown."""
+        if self._loss_count > 0:
+            # add average CE and reg losses to logs
+            logs["ce_loss"] = self._ce_loss_sum / self._loss_count
+            logs["reg_loss"] = self._reg_loss_sum / self._loss_count
+
+            # reset accumulators
+            self._ce_loss_sum = 0.0
+            self._reg_loss_sum = 0.0
+            self._loss_count = 0
+
+        super().log(logs, start_time)
 
 
 def main():
@@ -185,10 +254,15 @@ def main():
         deltaT=adalora_args.deltaT,
         total_step=total_steps,
         use_dora=adalora_args.use_dora,
+        orth_reg_weight=adalora_args.orth_reg_weight,
     )
 
     logger.info(f"PEFT Config: {peft_config}")
     logger.info(f"Total training steps: {total_steps}")
+    if adalora_args.init_r == adalora_args.target_r:
+        logger.info("Rank allocation DISABLED (init_r == target_r, no pruning)")
+    else:
+        logger.info(f"Rank allocation ENABLED (init_r={adalora_args.init_r} -> target_r={adalora_args.target_r})")
 
     # apply PEFT
     model = get_peft_model(model, peft_config)
@@ -241,8 +315,11 @@ def main():
     else:
         data_collator = None
 
-    # trainer with AdaLoRA callback
-    trainer = Trainer(
+    # skip rank allocation if init_r == target_r (no pruning needed)
+    skip_allocation = adalora_args.init_r == adalora_args.target_r
+
+    # trainer with AdaLoRA callback and CE loss tracking
+    trainer = AdaLoraTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset if training_args.do_train else None,
@@ -250,7 +327,8 @@ def main():
         compute_metrics=compute_metrics,
         processing_class=tokenizer,
         data_collator=data_collator,
-        callbacks=[AdaLoraCallback(model)],
+        callbacks=[AdaLoraCallback(model, skip_allocation=skip_allocation)],
+        is_regression=is_regression,
     )
 
     # training
