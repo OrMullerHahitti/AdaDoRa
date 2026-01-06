@@ -123,6 +123,7 @@ class AdaLoraModel(LoraModel):
             "fan_in_fan_out": lora_config.fan_in_fan_out,
             "init_lora_weights": lora_config.init_lora_weights,
             "use_dora": lora_config.use_dora,
+            "dora_init": lora_config.dora_init,
             "loaded_in_8bit": getattr(self.model, "is_loaded_in_8bit", False),
             "loaded_in_4bit": getattr(self.model, "is_loaded_in_4bit", False),
         }
@@ -152,6 +153,7 @@ class AdaLoraModel(LoraModel):
                 lora_config.lora_dropout,
                 lora_config.init_lora_weights,
                 use_dora=lora_config.use_dora,
+                dora_init=lora_config.dora_init,
             )
 
     @staticmethod

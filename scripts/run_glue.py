@@ -81,6 +81,7 @@ class AdaLoraArguments:
     """Arguments for AdaLoRA configuration."""
     peft_type: str = field(default="ADALORA", metadata={"help": "PEFT type: ADALORA or LORA"})
     use_dora: bool = field(default=False, metadata={"help": "Enable DoRA (Weight-Decomposed Low-Rank Adaptation)"})
+    dora_init: bool = field(default=False, metadata={"help": "Use DoRA-style init (B=0, E=1) instead of AdaLoRA-style (B=random, E=0)"})
     target_r: int = field(default=8, metadata={"help": "Target rank after pruning"})
     init_r: int = field(default=12, metadata={"help": "Initial rank (should be > target_r)"})
     lora_alpha: int = field(default=32, metadata={"help": "LoRA alpha scaling factor"})
@@ -120,13 +121,44 @@ class AdaLoraTrainer(Trainer):
     This trainer extracts and logs the pure CE loss for fair comparison with other methods.
     """
 
-    def __init__(self, *args, is_regression: bool = False, **kwargs):
+    def __init__(self, *args, is_regression: bool = False, use_dora: bool = False, **kwargs):
         super().__init__(*args, **kwargs)
         self.is_regression = is_regression
+        self.use_dora = use_dora
         # running averages for logging
         self._ce_loss_sum = 0.0
         self._reg_loss_sum = 0.0
         self._loss_count = 0
+
+    def _get_magnitude_stats(self) -> dict:
+        """
+        Extract DoRA magnitude vector statistics from the model.
+
+        Returns dict with mean, std, min, max of all magnitude vectors.
+        """
+        if not self.use_dora:
+            return {}
+
+        all_magnitudes = []
+        for name, module in self.model.named_modules():
+            if hasattr(module, "lora_magnitude_vector"):
+                for adapter_name, dora_layer in module.lora_magnitude_vector.items():
+                    if hasattr(dora_layer, "weight"):
+                        mag = dora_layer.weight.detach().flatten()
+                        all_magnitudes.append(mag)
+
+        if not all_magnitudes:
+            return {}
+
+        # concatenate all magnitude vectors
+        all_mag = torch.cat(all_magnitudes)
+
+        return {
+            "mag_mean": all_mag.mean().item(),
+            "mag_std": all_mag.std().item(),
+            "mag_min": all_mag.min().item(),
+            "mag_max": all_mag.max().item(),
+        }
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         """
@@ -160,7 +192,7 @@ class AdaLoraTrainer(Trainer):
         return (total_loss, outputs) if return_outputs else total_loss
 
     def log(self, logs: dict, start_time: Optional[float] = None) -> None:
-        """Override log to include CE and regularization loss breakdown."""
+        """Override log to include CE loss, regularization, and magnitude stats."""
         if self._loss_count > 0:
             # add average CE and reg losses to logs
             logs["ce_loss"] = self._ce_loss_sum / self._loss_count
@@ -170,6 +202,10 @@ class AdaLoraTrainer(Trainer):
             self._ce_loss_sum = 0.0
             self._reg_loss_sum = 0.0
             self._loss_count = 0
+
+        # add DoRA magnitude statistics
+        mag_stats = self._get_magnitude_stats()
+        logs.update(mag_stats)
 
         super().log(logs, start_time)
 
@@ -254,6 +290,7 @@ def main():
         deltaT=adalora_args.deltaT,
         total_step=total_steps,
         use_dora=adalora_args.use_dora,
+        dora_init=adalora_args.dora_init,
         orth_reg_weight=adalora_args.orth_reg_weight,
     )
 
@@ -329,6 +366,7 @@ def main():
         data_collator=data_collator,
         callbacks=[AdaLoraCallback(model, skip_allocation=skip_allocation)],
         is_regression=is_regression,
+        use_dora=adalora_args.use_dora,
     )
 
     # training

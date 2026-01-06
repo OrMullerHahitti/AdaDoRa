@@ -66,6 +66,13 @@ class AdaLoraConfig(LoraConfig):
     orth_reg_weight: float = field(default=0.5, metadata={"help": "The orthogonal regularization coefficient."})
     total_step: Optional[int] = field(default=None, metadata={"help": "The total training steps."})
     rank_pattern: Optional[dict] = field(default=None, metadata={"help": "The saved rank pattern."})
+    dora_init: bool = field(
+        default=False,
+        metadata={
+            "help": "Use DoRA-style initialization (B=0, E=1) instead of AdaLoRA-style (B=random, E=0). "
+            "Both start as no-op but have different learning dynamics."
+        },
+    )
 
     def __post_init__(self):
         super().__post_init__()

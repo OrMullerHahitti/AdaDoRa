@@ -48,7 +48,8 @@ class AdaLoraLayer(LoraLayer):
         self.lora_variant: dict[str, LoraVariant] = {}
 
     def update_layer(
-        self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights, inference_mode: bool = False, **kwargs
+        self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights, inference_mode: bool = False,
+        dora_init: bool = False, **kwargs
     ):
         if r < 0:
             # note: r == 0 is allowed for AdaLora, see #1539
@@ -75,16 +76,32 @@ class AdaLoraLayer(LoraLayer):
         self.ranknum[adapter_name].requires_grad = False
         self.scaling[adapter_name] = lora_alpha if lora_alpha > 0 else float(r)
         if init_lora_weights:
-            self.reset_lora_parameters(adapter_name)
+            self.reset_lora_parameters(adapter_name, dora_init=dora_init)
 
         self._move_adapter_to_device_of_base_layer(adapter_name)
         self.set_adapter(self.active_adapters, inference_mode=inference_mode)
 
-    def reset_lora_parameters(self, adapter_name):
+    def reset_lora_parameters(self, adapter_name, dora_init: bool = False):
+        """
+        Initialize LoRA parameters.
+
+        Args:
+            adapter_name: name of the adapter
+            dora_init: if True, use DoRA-style init (B=0, E=1);
+                       if False (default), use AdaLoRA-style init (B=random, E=0)
+        """
         if adapter_name in self.lora_A.keys():
-            nn.init.zeros_(self.lora_E[adapter_name])
+            # A is always randomly initialized
             nn.init.normal_(self.lora_A[adapter_name], mean=0.0, std=0.02)
-            nn.init.normal_(self.lora_B[adapter_name], mean=0.0, std=0.02)
+
+            if dora_init:
+                # dora-style: B=0 (gate closed), E=1 (pass-through)
+                nn.init.zeros_(self.lora_B[adapter_name])
+                nn.init.ones_(self.lora_E[adapter_name])
+            else:
+                # adalora-style (default): B=random (directions ready), E=0 (gate closed)
+                nn.init.normal_(self.lora_B[adapter_name], mean=0.0, std=0.02)
+                nn.init.zeros_(self.lora_E[adapter_name])
 
 
 class SVDLinear(nn.Module, AdaLoraLayer):
@@ -121,12 +138,12 @@ class SVDLinear(nn.Module, AdaLoraLayer):
 
     def update_layer(
         self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights,
-        inference_mode: bool = False, use_dora: bool = False, **kwargs
+        inference_mode: bool = False, use_dora: bool = False, dora_init: bool = False, **kwargs
     ):
         # call parent update_layer to set up base AdaLoRA parameters
         AdaLoraLayer.update_layer(
             self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights,
-            inference_mode=inference_mode, **kwargs
+            inference_mode=inference_mode, dora_init=dora_init, **kwargs
         )
 
         # initialize variant if needed (e.g., DoRA)
